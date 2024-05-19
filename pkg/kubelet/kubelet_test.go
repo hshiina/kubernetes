@@ -19,6 +19,7 @@ package kubelet
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -3222,6 +3223,7 @@ func TestSyncPodSpans(t *testing.T) {
 		tp,
 	)
 	assert.NoError(t, err)
+	kubelet.podCache = containertest.NewFakeCache(kubelet.containerRuntime)
 
 	pod := podWithUIDNameNsSpec("12345678", "foo", "new", v1.PodSpec{
 		Containers: []v1.Container{
@@ -3272,5 +3274,532 @@ func TestSyncPodSpans(t *testing.T) {
 
 	for _, span := range runtimeServiceSpans {
 		assert.Equal(t, span.Parent.SpanID(), rootSpan.SpanContext.SpanID(), fmt.Sprintf("runtime service span %s %s should be child of root span", span.Name, span.Parent.SpanID()))
+	}
+}
+
+type fakeCacheForWaitEvents struct {
+	podStatus     *kubecontainer.PodStatus
+	statusUpdates []*kubecontainer.Status
+	callCount     int
+}
+
+type containerStatusByCreated []*kubecontainer.Status
+
+func (c containerStatusByCreated) Len() int           { return len(c) }
+func (c containerStatusByCreated) Swap(i, j int)      { c[i], c[j] = c[j], c[i] }
+func (c containerStatusByCreated) Less(i, j int) bool { return c[i].CreatedAt.After(c[j].CreatedAt) }
+
+func (cache *fakeCacheForWaitEvents) GetNewerThan(id types.UID, minTime time.Time) (*kubecontainer.PodStatus, error) {
+	if cache.callCount >= len(cache.statusUpdates) {
+		cache.callCount++
+		time.Sleep(maxWaitForEventsAfterSyncPod)
+		return nil, fmt.Errorf("No more update")
+	}
+	update := cache.statusUpdates[cache.callCount]
+	found := false
+	for i, cStatus := range cache.podStatus.ContainerStatuses {
+		if cStatus.Name == update.Name && cStatus.ID == update.ID {
+			cache.podStatus.ContainerStatuses[i] = update
+			found = true
+			break
+		}
+	}
+	if !found {
+		cache.podStatus.ContainerStatuses = append(cache.podStatus.ContainerStatuses, update)
+		sort.Sort(containerStatusByCreated(cache.podStatus.ContainerStatuses))
+	}
+	cache.podStatus.TimeStamp = minTime.Add(100 * time.Millisecond)
+	cache.callCount++
+	return cache.podStatus, nil
+}
+
+func (*fakeCacheForWaitEvents) Get(types.UID) (*kubecontainer.PodStatus, error) {
+	return nil, nil
+}
+func (*fakeCacheForWaitEvents) Set(types.UID, *kubecontainer.PodStatus, error, time.Time) bool {
+	return false
+}
+func (*fakeCacheForWaitEvents) Delete(types.UID)     {}
+func (*fakeCacheForWaitEvents) UpdateTime(time.Time) {}
+
+func TestWaitEventsBySyncPod(t *testing.T) {
+	containerName1 := "container1"
+	containerName2 := "container2"
+	containerName3 := "container3"
+	oldContainerID1 := kubecontainer.BuildContainerID("testruntime", "container1v1")
+	oldContainerID2 := kubecontainer.BuildContainerID("testruntime", "container2v1")
+	oldContainerID3 := kubecontainer.BuildContainerID("testruntime", "container3v1")
+	newContainerID1 := kubecontainer.BuildContainerID("testruntime", "container1v2")
+	newContainerID2 := kubecontainer.BuildContainerID("testruntime", "container2v2")
+	newContainerID3 := kubecontainer.BuildContainerID("testruntime", "container3v2")
+
+	baseTime := time.Now()
+
+	for _, tc := range []struct {
+		testName          string
+		results           []*kubecontainer.SyncResult
+		initialStatus     []*kubecontainer.Status
+		statusUpdates     []*kubecontainer.Status
+		expectedCallCount int
+	}{
+		{
+			testName: "Start one container, timeout",
+			results: []*kubecontainer.SyncResult{
+				{
+					Action: kubecontainer.StartContainer,
+					Target: containerName1,
+				},
+			},
+			initialStatus: []*kubecontainer.Status{
+				{
+					Name:      containerName1,
+					ID:        newContainerID1,
+					State:     kubecontainer.ContainerStateCreated,
+					CreatedAt: baseTime.Add(1 * time.Second),
+				},
+			},
+			expectedCallCount: 1,
+		},
+		{
+			testName: "No actions to wait for",
+			results: []*kubecontainer.SyncResult{
+				{
+					Action: kubecontainer.ConfigPodSandbox,
+					Target: "11223344",
+				},
+			},
+			initialStatus: []*kubecontainer.Status{
+				{
+					Name:      containerName1,
+					ID:        oldContainerID1,
+					State:     kubecontainer.ContainerStateRunning,
+					CreatedAt: baseTime.Add(-200 * time.Second),
+					StartedAt: baseTime.Add(-199 * time.Second),
+				},
+			},
+			expectedCallCount: 0,
+		},
+		{
+			testName: "Start one container",
+			results: []*kubecontainer.SyncResult{
+				{
+					Action: kubecontainer.StartContainer,
+					Target: containerName1,
+				},
+			},
+			initialStatus: []*kubecontainer.Status{
+				{
+					Name:      containerName1,
+					ID:        newContainerID1,
+					State:     kubecontainer.ContainerStateCreated,
+					CreatedAt: baseTime.Add(1 * time.Second),
+				},
+			},
+			statusUpdates: []*kubecontainer.Status{
+				{
+					Name:      containerName1,
+					ID:        newContainerID1,
+					State:     kubecontainer.ContainerStateRunning,
+					CreatedAt: baseTime.Add(1 * time.Second),
+					StartedAt: baseTime.Add(2 * time.Second),
+				},
+			},
+			expectedCallCount: 1,
+		},
+		{
+			testName: "Failed to start one container",
+			results: []*kubecontainer.SyncResult{
+				{
+					Action: kubecontainer.StartContainer,
+					Target: containerName1,
+					Error:  errors.New("failed to start container"),
+				},
+			},
+			initialStatus: []*kubecontainer.Status{
+				{
+					Name:      containerName1,
+					ID:        newContainerID1,
+					State:     kubecontainer.ContainerStateCreated,
+					CreatedAt: baseTime.Add(1 * time.Second),
+				},
+			},
+			expectedCallCount: 0,
+		},
+		{
+			testName: "Start one container, which exits soon",
+			results: []*kubecontainer.SyncResult{
+				{
+					Action: kubecontainer.StartContainer,
+					Target: containerName1,
+				},
+			},
+			initialStatus: []*kubecontainer.Status{
+				{
+					Name:      containerName1,
+					ID:        newContainerID1,
+					State:     kubecontainer.ContainerStateRunning,
+					CreatedAt: baseTime.Add(1 * time.Second),
+					StartedAt: baseTime.Add(2 * time.Second),
+				},
+			},
+			statusUpdates: []*kubecontainer.Status{
+				{
+					Name:       containerName1,
+					ID:         newContainerID1,
+					State:      kubecontainer.ContainerStateExited,
+					CreatedAt:  baseTime.Add(1 * time.Second),
+					StartedAt:  baseTime.Add(2 * time.Second),
+					FinishedAt: baseTime.Add(3 * time.Second),
+				},
+			},
+			expectedCallCount: 1,
+		},
+		{
+			testName: "Stop one container",
+			results: []*kubecontainer.SyncResult{
+				{
+					Action: kubecontainer.KillContainer,
+					Target: containerName1,
+				},
+			},
+			initialStatus: []*kubecontainer.Status{
+				{
+					Name:      containerName1,
+					ID:        oldContainerID1,
+					State:     kubecontainer.ContainerStateRunning,
+					CreatedAt: baseTime.Add(-100 * time.Second),
+					StartedAt: baseTime.Add(-99 * time.Second),
+				},
+			},
+			statusUpdates: []*kubecontainer.Status{
+				{
+					Name:       containerName1,
+					ID:         oldContainerID1,
+					State:      kubecontainer.ContainerStateExited,
+					CreatedAt:  baseTime.Add(-100 * time.Second),
+					StartedAt:  baseTime.Add(-99 * time.Second),
+					FinishedAt: baseTime.Add(1 * time.Second),
+				},
+			},
+			expectedCallCount: 1,
+		},
+		{
+			testName: "Restart one container",
+			results: []*kubecontainer.SyncResult{
+				{
+					Action: kubecontainer.KillContainer,
+					Target: containerName1,
+				},
+				{
+					Action: kubecontainer.StartContainer,
+					Target: containerName1,
+				},
+			},
+			initialStatus: []*kubecontainer.Status{
+				{
+					Name:      containerName1,
+					ID:        oldContainerID1,
+					State:     kubecontainer.ContainerStateRunning,
+					CreatedAt: baseTime.Add(-100 * time.Second),
+					StartedAt: baseTime.Add(-99 * time.Second),
+				},
+			},
+			statusUpdates: []*kubecontainer.Status{
+				{
+					Name:       containerName1,
+					ID:         oldContainerID1,
+					State:      kubecontainer.ContainerStateExited,
+					CreatedAt:  baseTime.Add(-100 * time.Second),
+					StartedAt:  baseTime.Add(-99 * time.Second),
+					FinishedAt: baseTime.Add(1 * time.Second),
+				},
+				{
+					Name:      containerName1,
+					ID:        newContainerID1,
+					State:     kubecontainer.ContainerStateCreated,
+					CreatedAt: baseTime.Add(2 * time.Second),
+				},
+				{
+					Name:      containerName1,
+					ID:        newContainerID1,
+					State:     kubecontainer.ContainerStateRunning,
+					CreatedAt: baseTime.Add(2 * time.Second),
+					StartedAt: baseTime.Add(3 * time.Second),
+				},
+			},
+			expectedCallCount: 3,
+		},
+		{
+			testName: "Restart one container, fail to start",
+			results: []*kubecontainer.SyncResult{
+				{
+					Action: kubecontainer.KillContainer,
+					Target: containerName1,
+				},
+				{
+					Action: kubecontainer.StartContainer,
+					Target: containerName1,
+					Error:  errors.New("failed to start container"),
+				},
+			},
+			initialStatus: []*kubecontainer.Status{
+				{
+					Name:      containerName1,
+					ID:        oldContainerID1,
+					State:     kubecontainer.ContainerStateRunning,
+					CreatedAt: baseTime.Add(-100 * time.Second),
+					StartedAt: baseTime.Add(-99 * time.Second),
+				},
+			},
+			statusUpdates: []*kubecontainer.Status{
+				{
+					Name:       containerName1,
+					ID:         oldContainerID1,
+					State:      kubecontainer.ContainerStateExited,
+					CreatedAt:  baseTime.Add(-100 * time.Second),
+					StartedAt:  baseTime.Add(-99 * time.Second),
+					FinishedAt: baseTime.Add(1 * time.Second),
+				},
+			},
+			expectedCallCount: 1,
+		},
+		{
+			testName: "Start three containers",
+			results: []*kubecontainer.SyncResult{
+				{
+					Action: kubecontainer.StartContainer,
+					Target: containerName1,
+				},
+				{
+					Action: kubecontainer.StartContainer,
+					Target: containerName2,
+				},
+				{
+					Action: kubecontainer.StartContainer,
+					Target: containerName3,
+				},
+			},
+			statusUpdates: []*kubecontainer.Status{
+				{
+					Name:      containerName1,
+					ID:        newContainerID1,
+					State:     kubecontainer.ContainerStateCreated,
+					CreatedAt: baseTime.Add(1 * time.Second),
+				},
+				{
+					Name:      containerName1,
+					ID:        newContainerID1,
+					State:     kubecontainer.ContainerStateRunning,
+					CreatedAt: baseTime.Add(1 * time.Second),
+					StartedAt: baseTime.Add(2 * time.Second),
+				},
+				{
+					Name:      containerName2,
+					ID:        newContainerID2,
+					State:     kubecontainer.ContainerStateCreated,
+					CreatedAt: baseTime.Add(2 * time.Second),
+				},
+				{
+					Name:      containerName3,
+					ID:        newContainerID3,
+					State:     kubecontainer.ContainerStateCreated,
+					CreatedAt: baseTime.Add(2 * time.Second),
+				},
+				{
+					Name:      containerName2,
+					ID:        newContainerID2,
+					State:     kubecontainer.ContainerStateRunning,
+					CreatedAt: baseTime.Add(2 * time.Second),
+					StartedAt: baseTime.Add(3 * time.Second),
+				},
+				{
+					Name:      containerName3,
+					ID:        newContainerID3,
+					State:     kubecontainer.ContainerStateRunning,
+					CreatedAt: baseTime.Add(2 * time.Second),
+					StartedAt: baseTime.Add(3 * time.Second),
+				},
+			},
+			expectedCallCount: 6,
+		},
+		{
+			testName: "Start three containers, almost done before wait",
+			results: []*kubecontainer.SyncResult{
+				{
+					Action: kubecontainer.StartContainer,
+					Target: containerName1,
+				},
+				{
+					Action: kubecontainer.StartContainer,
+					Target: containerName2,
+				},
+				{
+					Action: kubecontainer.StartContainer,
+					Target: containerName3,
+				},
+			},
+			initialStatus: []*kubecontainer.Status{
+				{
+					Name:      containerName1,
+					ID:        newContainerID1,
+					State:     kubecontainer.ContainerStateRunning,
+					CreatedAt: baseTime.Add(1 * time.Second),
+					StartedAt: baseTime.Add(2 * time.Second),
+				},
+				{
+					Name:      containerName2,
+					ID:        newContainerID2,
+					State:     kubecontainer.ContainerStateRunning,
+					CreatedAt: baseTime.Add(1 * time.Second),
+					StartedAt: baseTime.Add(2 * time.Second),
+				},
+				{
+					Name:      containerName3,
+					ID:        newContainerID3,
+					State:     kubecontainer.ContainerStateCreated,
+					CreatedAt: baseTime.Add(1 * time.Second),
+				},
+			},
+			statusUpdates: []*kubecontainer.Status{
+				{
+					Name:      containerName3,
+					ID:        newContainerID3,
+					State:     kubecontainer.ContainerStateRunning,
+					CreatedAt: baseTime.Add(1 * time.Second),
+					StartedAt: baseTime.Add(3 * time.Second),
+				},
+			},
+			expectedCallCount: 1,
+		},
+		{
+			testName: "Start one container, Stop another and Restart the other",
+			results: []*kubecontainer.SyncResult{
+				{
+					Action: kubecontainer.KillContainer,
+					Target: containerName2,
+				},
+				{
+					Action: kubecontainer.KillContainer,
+					Target: containerName3,
+				},
+				{
+					Action: kubecontainer.StartContainer,
+					Target: containerName1,
+				},
+				{
+					Action: kubecontainer.StartContainer,
+					Target: containerName3,
+				},
+			},
+			initialStatus: []*kubecontainer.Status{
+				{
+					Name:       containerName1,
+					ID:         oldContainerID1,
+					State:      kubecontainer.ContainerStateExited,
+					CreatedAt:  baseTime.Add(-100 * time.Second),
+					StartedAt:  baseTime.Add(-99 * time.Second),
+					FinishedAt: baseTime.Add(-80 * time.Second),
+				},
+				{
+					Name:      containerName2,
+					ID:        oldContainerID2,
+					State:     kubecontainer.ContainerStateRunning,
+					CreatedAt: baseTime.Add(-100 * time.Second),
+					StartedAt: baseTime.Add(-99 * time.Second),
+				},
+				{
+					Name:      containerName3,
+					ID:        oldContainerID3,
+					State:     kubecontainer.ContainerStateRunning,
+					CreatedAt: baseTime.Add(-200 * time.Second),
+					StartedAt: baseTime.Add(-199 * time.Second),
+				},
+			},
+			statusUpdates: []*kubecontainer.Status{
+				{
+					Name:       containerName2,
+					ID:         oldContainerID2,
+					State:      kubecontainer.ContainerStateExited,
+					CreatedAt:  baseTime.Add(-100 * time.Second),
+					StartedAt:  baseTime.Add(-99 * time.Second),
+					FinishedAt: baseTime.Add(1 * time.Second),
+				},
+				{
+					Name:       containerName3,
+					ID:         oldContainerID3,
+					State:      kubecontainer.ContainerStateExited,
+					CreatedAt:  baseTime.Add(-200 * time.Second),
+					StartedAt:  baseTime.Add(-199 * time.Second),
+					FinishedAt: baseTime.Add(1 * time.Second),
+				},
+				{
+					Name:      containerName1,
+					ID:        newContainerID1,
+					State:     kubecontainer.ContainerStateCreated,
+					CreatedAt: baseTime.Add(2 * time.Second),
+				},
+				{
+					Name:      containerName3,
+					ID:        newContainerID3,
+					State:     kubecontainer.ContainerStateCreated,
+					CreatedAt: baseTime.Add(2 * time.Second),
+				},
+				{
+					Name:      containerName3,
+					ID:        newContainerID3,
+					State:     kubecontainer.ContainerStateRunning,
+					CreatedAt: baseTime.Add(2 * time.Second),
+					StartedAt: baseTime.Add(3 * time.Second),
+				},
+				{
+					Name:      containerName1,
+					ID:        newContainerID1,
+					State:     kubecontainer.ContainerStateRunning,
+					CreatedAt: baseTime.Add(2 * time.Second),
+					StartedAt: baseTime.Add(3 * time.Second),
+				},
+			},
+			expectedCallCount: 6,
+		},
+	} {
+		t.Run(tc.testName, func(t *testing.T) {
+			startTime := time.Now()
+			gap := startTime.Sub(baseTime)
+			adjustTime := func(states []*kubecontainer.Status) {
+				for _, c := range states {
+					if !c.CreatedAt.IsZero() {
+						c.CreatedAt = c.CreatedAt.Add(gap)
+					}
+					if !c.StartedAt.IsZero() {
+						c.StartedAt = c.StartedAt.Add(gap)
+					}
+					if !c.FinishedAt.IsZero() {
+						c.FinishedAt = c.FinishedAt.Add(gap)
+					}
+				}
+			}
+			adjustTime(tc.initialStatus)
+			adjustTime(tc.statusUpdates)
+
+			pod := podWithUIDNameNs("12345678", "foo", "new")
+			podStatus := kubecontainer.PodStatus{
+				ID:                pod.UID,
+				Name:              pod.Name,
+				ContainerStatuses: tc.initialStatus,
+			}
+			fakeCache := &fakeCacheForWaitEvents{
+				podStatus:     &podStatus,
+				statusUpdates: tc.statusUpdates,
+			}
+			kubelet := &Kubelet{
+				clock:    clock.RealClock{},
+				podCache: fakeCache,
+			}
+
+			kubelet.waitEventsBySyncPod(pod, &kubecontainer.PodSyncResult{SyncResults: tc.results}, startTime)
+
+			assert.Equal(t, tc.expectedCallCount, fakeCache.callCount, "GetNewerThan() was not called as expected")
+		})
+
 	}
 }
