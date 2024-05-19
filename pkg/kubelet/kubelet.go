@@ -205,6 +205,10 @@ const (
 
 	// instrumentationScope is the name of OpenTelemetry instrumentation scope
 	instrumentationScope = "k8s.io/kubernetes/pkg/kubelet"
+
+	// Max amount of time to wait for events along with SyncPod().
+	// Usually, an event is delivered in single relisting period. Adding 1s jitter.
+	maxWaitForEventsAfterSyncPod = genericPlegRelistPeriod + time.Second*1
 )
 
 var (
@@ -1957,6 +1961,7 @@ func (kl *Kubelet) SyncPod(ctx context.Context, updateType kubetypes.SyncPodType
 	// Use WithoutCancel instead of a new context.TODO() to propagate trace context
 	// Call the container runtime's SyncPod callback
 	sctx := context.WithoutCancel(ctx)
+	syncStartTime := kl.clock.Now()
 	result := kl.containerRuntime.SyncPod(sctx, pod, podStatus, pullSecrets, kl.backOff)
 	kl.reasonCache.Update(pod.UID, result)
 	if err := result.Error(); err != nil {
@@ -1978,6 +1983,45 @@ func (kl *Kubelet) SyncPod(ctx context.Context, updateType kubetypes.SyncPodType
 		if err, _ := kl.pleg.UpdateCache(&runningPod, pod.UID); err != nil {
 			klog.ErrorS(err, "Failed to update pod cache", "pod", klog.KObj(pod))
 			return false, err
+		}
+	}
+
+	if utilfeature.DefaultFeatureGate.Enabled(features.EventedPLEG) {
+		// Wait for PLEG to get events from all containers which are started or stopped in syncPod().
+		// This should be done here because what the worker requested remains in PodSyncResult.
+		lastGetTime := syncStartTime
+		maxWaitTime := kl.clock.Now().Add(maxWaitForEventsAfterSyncPod)
+	wait_event:
+		for {
+			if kl.clock.Now().After(maxWaitTime) {
+				return false, fmt.Errorf("PLEG has not received expected events in time")
+			}
+			latestPodStatus, err := kl.podCache.GetNewerThan(pod.UID, lastGetTime)
+			if err != nil {
+				return false, err
+			}
+			lastGetTime = kl.clock.Now()
+			for _, r := range result.SyncResults {
+				if r.Error != nil || r.Action != kubecontainer.StartContainer && r.Action != kubecontainer.KillContainer {
+					continue
+				}
+				cName := r.Target.(string)
+				if r.Action == kubecontainer.StartContainer {
+					cStatus := latestPodStatus.FindContainerStatusByName(cName)
+					if cStatus == nil || cStatus.StartedAt.Before(syncStartTime) {
+						klog.V(4).InfoS("Waiting for PLEG to receive Container Started Event", "pod", klog.KObj(pod), "container", cName)
+						continue wait_event
+					}
+				} else if r.Action == kubecontainer.KillContainer {
+					for _, cStatus := range latestPodStatus.ContainerStatuses {
+						if cStatus.Name == cName && cStatus.StartedAt.Before(syncStartTime) && cStatus.State != kubecontainer.ContainerStateExited {
+							klog.V(4).InfoS("Waiting for PLEG to receive Container Stopped Event", "pod", klog.KObj(pod), "container", cName)
+							continue wait_event
+						}
+					}
+				}
+			}
+			break
 		}
 	}
 
@@ -2020,6 +2064,7 @@ func (kl *Kubelet) SyncTerminatingPod(_ context.Context, pod *v1.Pod, podStatus 
 
 	kl.probeManager.StopLivenessAndStartup(pod)
 
+	killStartTime := kl.clock.Now()
 	p := kubecontainer.ConvertPodStatusToRunningPod(kl.getRuntime().Type(), podStatus)
 	if err := kl.killPod(ctx, pod, p, gracePeriod); err != nil {
 		kl.recorder.Eventf(pod, v1.EventTypeWarning, events.FailedToKillPod, "error killing pod: %v", err)
@@ -2039,10 +2084,37 @@ func (kl *Kubelet) SyncTerminatingPod(_ context.Context, pod *v1.Pod, podStatus 
 	// catch race conditions introduced by callers updating pod status out of order.
 	// TODO: have KillPod return the terminal status of stopped containers and write that into the
 	//  cache immediately
-	stoppedPodStatus, err := kl.containerRuntime.GetPodStatus(ctx, pod.UID, pod.Name, pod.Namespace)
-	if err != nil {
-		klog.ErrorS(err, "Unable to read pod status prior to final pod termination", "pod", klog.KObj(pod), "podUID", pod.UID)
-		return err
+	var stoppedPodStatus *kubecontainer.PodStatus
+	if utilfeature.DefaultFeatureGate.Enabled(features.EventedPLEG) {
+		lastCheckTime := killStartTime
+		maxWaitTime := kl.clock.Now().Add(maxWaitForEventsAfterSyncPod)
+	wait_event:
+		for {
+			var err error
+			stoppedPodStatus, err = kl.podCache.GetNewerThan(pod.UID, lastCheckTime)
+			if err != nil {
+				klog.ErrorS(err, "Unable to read pod status prior to final pod termination", "pod", klog.KObj(pod), "podUID", pod.UID)
+				return err
+			}
+			lastCheckTime = kl.clock.Now()
+			for _, s := range stoppedPodStatus.ContainerStatuses {
+				if s.State == kubecontainer.ContainerStateRunning {
+					if kl.clock.Now().After(maxWaitTime) {
+						break wait_event
+					}
+					klog.V(4).InfoS("Waiting for PLEG to receive Container Stopped Event", "pod", klog.KObj(pod), "container", s.Name)
+					continue wait_event
+				}
+			}
+			break
+		}
+	} else {
+		var err error
+		stoppedPodStatus, err = kl.containerRuntime.GetPodStatus(ctx, pod.UID, pod.Name, pod.Namespace)
+		if err != nil {
+			klog.ErrorS(err, "Unable to read pod status prior to final pod termination", "pod", klog.KObj(pod), "podUID", pod.UID)
+			return err
+		}
 	}
 	preserveDataFromBeforeStopping(stoppedPodStatus, podStatus)
 	var runningContainers []string

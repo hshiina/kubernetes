@@ -3222,6 +3222,7 @@ func TestSyncPodSpans(t *testing.T) {
 		tp,
 	)
 	assert.NoError(t, err)
+	kubelet.podCache = containertest.NewFakeCache(kubelet.containerRuntime)
 
 	pod := podWithUIDNameNsSpec("12345678", "foo", "new", v1.PodSpec{
 		Containers: []v1.Container{
