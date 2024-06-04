@@ -728,6 +728,27 @@ done
 			return false, nil
 		}, 1*time.Minute, framework.Poll).ShouldNot(gomega.BeTrue(), "should not see liveness probes")
 	})
+	ginkgo.It("should be restarted with a httpGet with disconnection after receiving success code", func(ctx context.Context) {
+		livenessProbe := &v1.Probe{
+			ProbeHandler:        httpGetHandler("/healthz-success-disconnect", 8080),
+			InitialDelaySeconds: 15,
+			FailureThreshold:    1,
+		}
+		readinessProbe := livenessProbe
+		pod := livenessPodSpec(f.Namespace.Name, readinessProbe, livenessProbe)
+		RunLivenessTest(ctx, f, pod, 1, defaultObservationTimeout)
+	})
+
+	ginkgo.It("should be restarted with a httpGet with disconnection after receiving error code", func(ctx context.Context) {
+		livenessProbe := &v1.Probe{
+			ProbeHandler:        httpGetHandler("/healthz-error-disconnect", 8080),
+			InitialDelaySeconds: 15,
+			FailureThreshold:    1,
+		}
+		readinessProbe := livenessProbe
+		pod := livenessPodSpec(f.Namespace.Name, readinessProbe, livenessProbe)
+		RunLivenessTest(ctx, f, pod, 1, defaultObservationTimeout)
+	})
 })
 
 var _ = SIGDescribe(nodefeature.SidecarContainers, feature.SidecarContainers, "Probing restartable init container", func() {

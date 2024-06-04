@@ -63,5 +63,21 @@ func main(cmd *cobra.Command, args []string) {
 		}
 		http.Redirect(w, r, loc, http.StatusFound)
 	})
+
+	disconnect := func(w http.ResponseWriter) {
+		c, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		c.Close()
+	}
+	http.HandleFunc("/healthz-success-disconnect", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		disconnect(w)
+	})
+	http.HandleFunc("/healthz-error-disconnect", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(500)
+		disconnect(w)
+	})
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
