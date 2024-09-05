@@ -1343,6 +1343,186 @@ func doPodResizeTests() {
 				},
 			},
 		},
+		{
+			name: "Burstable QoS pod, one container with cpu & memory requests - add limits",
+			containers: []TestContainerInfo{
+				{
+					Name:      "c1",
+					Resources: &ContainerResources{CPUReq: "100m", MemReq: "100Mi"},
+				},
+			},
+			patchString: `{"spec":{"containers":[
+						{"name":"c1", "resources":{"limits":{"cpu":"150m", "memory":"150Mi"}}}
+					]}}`,
+			expected: []TestContainerInfo{
+				{
+					Name:      "c1",
+					Resources: &ContainerResources{CPUReq: "100m", MemReq: "100Mi", CPULim: "150m", MemLim: "150Mi"},
+				},
+			},
+		},
+		{
+			name: "Burstable QoS pod, one container with cpu & memory requests + limits - remove limits",
+			containers: []TestContainerInfo{
+				{
+					Name:      "c1",
+					Resources: &ContainerResources{CPUReq: "100m", MemReq: "100Mi", CPULim: "150m", MemLim: "150Mi"},
+				},
+			},
+			patchString: `{"spec":{"containers":[
+						{"name":"c1", "resources":{"limits":null}}
+					]}}`,
+			expected: []TestContainerInfo{
+				{
+					Name:      "c1",
+					Resources: &ContainerResources{CPUReq: "100m", MemReq: "100Mi"},
+				},
+			},
+		},
+		{
+			name: "Burstable QoS pod, one container with cpu & memory requests - add cpu limits",
+			containers: []TestContainerInfo{
+				{
+					Name:      "c1",
+					Resources: &ContainerResources{CPUReq: "100m", MemReq: "100Mi"},
+				},
+			},
+			patchString: `{"spec":{"containers":[
+						{"name":"c1", "resources":{"limits":{"cpu":"150m"}}}
+					]}}`,
+			expected: []TestContainerInfo{
+				{
+					Name:      "c1",
+					Resources: &ContainerResources{CPUReq: "100m", MemReq: "100Mi", CPULim: "150m"},
+				},
+			},
+		},
+		{
+			name: "Burstable QoS pod, one container with cpu & memory requests + cpu limits - remove limits",
+			containers: []TestContainerInfo{
+				{
+					Name:      "c1",
+					Resources: &ContainerResources{CPUReq: "100m", MemReq: "100Mi", CPULim: "150m"},
+				},
+			},
+			patchString: `{"spec":{"containers":[
+						{"name":"c1", "resources":{"limits":null}}
+					]}}`,
+			expected: []TestContainerInfo{
+				{
+					Name:      "c1",
+					Resources: &ContainerResources{CPUReq: "100m", MemReq: "100Mi"},
+				},
+			},
+		},
+		{
+			name: "Burstable QoS pod, one container with cpu & memory requests - add memory limits",
+			containers: []TestContainerInfo{
+				{
+					Name:      "c1",
+					Resources: &ContainerResources{CPUReq: "100m", MemReq: "100Mi"},
+				},
+			},
+			patchString: `{"spec":{"containers":[
+						{"name":"c1", "resources":{"limits":{"memory":"150Mi"}}}
+					]}}`,
+			expected: []TestContainerInfo{
+				{
+					Name:      "c1",
+					Resources: &ContainerResources{CPUReq: "100m", MemReq: "100Mi", MemLim: "150Mi"},
+				},
+			},
+		},
+		{
+			name: "Burstable QoS pod, one container with cpu & memory requests + memory limits - remove limits",
+			containers: []TestContainerInfo{
+				{
+					Name:      "c1",
+					Resources: &ContainerResources{CPUReq: "100m", MemReq: "100Mi", MemLim: "150Mi"},
+				},
+			},
+			patchString: `{"spec":{"containers":[
+						{"name":"c1", "resources":{"limits":null}}
+					]}}`,
+			expected: []TestContainerInfo{
+				{
+					Name:      "c1",
+					Resources: &ContainerResources{CPUReq: "100m", MemReq: "100Mi"},
+				},
+			},
+		},
+		{
+			name: "Burstable QoS pod, one container with cpu & memory requests + memory limits - add cpu limits",
+			containers: []TestContainerInfo{
+				{
+					Name:      "c1",
+					Resources: &ContainerResources{CPUReq: "100m", MemReq: "100Mi", MemLim: "150Mi"},
+				},
+			},
+			patchString: `{"spec":{"containers":[
+						{"name":"c1", "resources":{"limits":{"cpu":"150m"}}}
+					]}}`,
+			expected: []TestContainerInfo{
+				{
+					Name:      "c1",
+					Resources: &ContainerResources{CPUReq: "100m", MemReq: "100Mi", CPULim: "150m", MemLim: "150Mi"},
+				},
+			},
+		},
+		{
+			name: "Burstable QoS pod, one container with cpu & memory requests + limits - remove cpu limits",
+			containers: []TestContainerInfo{
+				{
+					Name:      "c1",
+					Resources: &ContainerResources{CPUReq: "100m", MemReq: "100Mi", CPULim: "150m", MemLim: "150Mi"},
+				},
+			},
+			patchString: `{"spec":{"containers":[
+						{"name":"c1", "resources":{"limits":{"cpu":null}}}
+					]}}`,
+			expected: []TestContainerInfo{
+				{
+					Name:      "c1",
+					Resources: &ContainerResources{CPUReq: "100m", MemReq: "100Mi", MemLim: "150Mi"},
+				},
+			},
+		},
+		{
+			name: "Burstable QoS pod, one container with cpu & memory requests + memory limits - add memory limits",
+			containers: []TestContainerInfo{
+				{
+					Name:      "c1",
+					Resources: &ContainerResources{CPUReq: "100m", MemReq: "100Mi", CPULim: "150m"},
+				},
+			},
+			patchString: `{"spec":{"containers":[
+						{"name":"c1", "resources":{"limits":{"memory":"150Mi"}}}
+					]}}`,
+			expected: []TestContainerInfo{
+				{
+					Name:      "c1",
+					Resources: &ContainerResources{CPUReq: "100m", MemReq: "100Mi", CPULim: "150m", MemLim: "150Mi"},
+				},
+			},
+		},
+		{
+			name: "Burstable QoS pod, one container with cpu & memory requests + limits - remove memory limits",
+			containers: []TestContainerInfo{
+				{
+					Name:      "c1",
+					Resources: &ContainerResources{CPUReq: "100m", MemReq: "100Mi", CPULim: "150m", MemLim: "150Mi"},
+				},
+			},
+			patchString: `{"spec":{"containers":[
+						{"name":"c1", "resources":{"limits":{"memory":null}}}
+					]}}`,
+			expected: []TestContainerInfo{
+				{
+					Name:      "c1",
+					Resources: &ContainerResources{CPUReq: "100m", MemReq: "100Mi", CPULim: "150m"},
+				},
+			},
+		},
 	}
 
 	timeouts := framework.NewTimeoutContext()
