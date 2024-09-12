@@ -314,72 +314,88 @@ func verifyPodContainersCgroupValues(ctx context.Context, f *framework.Framework
 	for _, ci := range tcInfo {
 		var cpuRequest, cpuLimit *resource.Quantity
 		var expectedMemLimitInBytes int64
-		if ci.Resources != nil {
-			tc, _ := makeTestContainer(ci)
-			if tc.Resources.Limits != nil || tc.Resources.Requests != nil {
-				var expectedCPUShares int64
-				var expectedCPULimitString, expectedMemLimitString string
-				expectedMemLimitInBytes = tc.Resources.Limits.Memory().Value()
-				cpuRequest = tc.Resources.Requests.Cpu()
-				cpuLimit = tc.Resources.Limits.Cpu()
-				if cpuRequest.IsZero() && !cpuLimit.IsZero() {
-					expectedCPUShares = int64(kubecm.MilliCPUToShares(cpuLimit.MilliValue()))
+
+		accumulateContainerValues := func() {
+			// Accumulate container resources for verifying pod
+			if cpuRequest != nil {
+				podCPURequestMilliValue += cpuRequest.MilliValue()
+			}
+			if podCPULimitMilliValue >= 0 {
+				if cpuLimit == nil || cpuLimit.IsZero() {
+					podCPULimitMilliValue = -1
 				} else {
-					expectedCPUShares = int64(kubecm.MilliCPUToShares(cpuRequest.MilliValue()))
+					podCPULimitMilliValue += cpuLimit.MilliValue()
 				}
-				cpuQuota := kubecm.MilliCPUToQuota(cpuLimit.MilliValue(), kubecm.QuotaPeriod)
-				if cpuLimit.IsZero() {
-					cpuQuota = -1
-				}
-				expectedCPULimitString = strconv.FormatInt(cpuQuota, 10)
-				expectedMemLimitString = strconv.FormatInt(expectedMemLimitInBytes, 10)
-				if podOnCgroupv2Node {
-					if expectedCPULimitString == "-1" {
-						expectedCPULimitString = "max"
-					}
-					expectedCPULimitString = fmt.Sprintf("%s %s", expectedCPULimitString, CPUPeriod)
-					if expectedMemLimitString == "0" {
-						expectedMemLimitString = "max"
-					}
-					// convert cgroup v1 cpu.shares value to cgroup v2 cpu.weight value
-					// https://github.com/kubernetes/enhancements/tree/master/keps/sig-node/2254-cgroup-v2#phase-1-convert-from-cgroups-v1-settings-to-v2
-					expectedCPUShares = int64(1 + ((expectedCPUShares-2)*9999)/262142)
-				}
-				if expectedMemLimitString != "0" {
-					err := verifyCgroupValue(ci.Name, cgroupMemLimit, expectedMemLimitString)
-					if err != nil {
-						return err
-					}
-				}
-				err := verifyCgroupValue(ci.Name, cgroupCPULimit, expectedCPULimitString)
-				if err != nil {
-					return err
-				}
-				err = verifyCgroupValue(ci.Name, cgroupCPURequest, strconv.FormatInt(expectedCPUShares, 10))
-				if err != nil {
-					return err
+			}
+			if podMemoryLimitInBytes >= 0 {
+				if expectedMemLimitInBytes == 0 {
+					podMemoryLimitInBytes = -1
+				} else {
+					podMemoryLimitInBytes += expectedMemLimitInBytes
 				}
 			}
 		}
 
-		// Accumulate container resources for verifying pod
-		if cpuRequest != nil {
-			podCPURequestMilliValue += cpuRequest.MilliValue()
+		if ci.Resources == nil {
+			accumulateContainerValues()
+			continue
 		}
-		if podCPULimitMilliValue >= 0 {
-			if cpuLimit == nil || cpuLimit.IsZero() {
-				podCPULimitMilliValue = -1
-			} else {
-				podCPULimitMilliValue += cpuLimit.MilliValue()
+
+		tc, _ := makeTestContainer(ci)
+		if tc.Resources.Limits == nil && tc.Resources.Requests == nil {
+			accumulateContainerValues()
+			continue
+		}
+
+		var expectedCPUShares int64
+		var expectedCPULimitString, expectedMemLimitString string
+		expectedMemLimitInBytes = tc.Resources.Limits.Memory().Value()
+		cpuRequest = tc.Resources.Requests.Cpu()
+		cpuLimit = tc.Resources.Limits.Cpu()
+		if cpuRequest.IsZero() && !cpuLimit.IsZero() {
+			expectedCPUShares = int64(kubecm.MilliCPUToShares(cpuLimit.MilliValue()))
+		} else {
+			expectedCPUShares = int64(kubecm.MilliCPUToShares(cpuRequest.MilliValue()))
+		}
+		cpuQuota := kubecm.MilliCPUToQuota(cpuLimit.MilliValue(), kubecm.QuotaPeriod)
+		if cpuLimit.IsZero() {
+			cpuQuota = -1
+		}
+		expectedCPULimitString = strconv.FormatInt(cpuQuota, 10)
+		expectedMemLimitString = strconv.FormatInt(expectedMemLimitInBytes, 10)
+		if podOnCgroupv2Node {
+			if expectedCPULimitString == "-1" {
+				expectedCPULimitString = "max"
+			}
+			expectedCPULimitString = fmt.Sprintf("%s %s", expectedCPULimitString, CPUPeriod)
+			if expectedMemLimitString == "0" {
+				expectedMemLimitString = "max"
+			}
+			// convert cgroup v1 cpu.shares value to cgroup v2 cpu.weight value
+			// https://github.com/kubernetes/enhancements/tree/master/keps/sig-node/2254-cgroup-v2#phase-1-convert-from-cgroups-v1-settings-to-v2
+			expectedCPUShares = 1 + ((expectedCPUShares-2)*9999)/262142
+		}
+		if expectedMemLimitString != "0" {
+			err := verifyCgroupValue(ci.Name, cgroupMemLimit, expectedMemLimitString)
+			if err != nil {
+				return err
 			}
 		}
-		if podMemoryLimitInBytes >= 0 {
-			if expectedMemLimitInBytes == 0 {
-				podMemoryLimitInBytes = -1
-			} else {
-				podMemoryLimitInBytes += expectedMemLimitInBytes
-			}
+		err := verifyCgroupValue(ci.Name, cgroupCPULimit, expectedCPULimitString)
+		if err != nil {
+			return err
 		}
+		err = verifyCgroupValue(ci.Name, cgroupCPURequest, strconv.FormatInt(expectedCPUShares, 10))
+		if err != nil {
+			return err
+		}
+
+		accumulateContainerValues()
+	}
+
+	if !IsCgroup2UnifiedMode() {
+		// cgroup v1 is in maintenance mode. Skip verifying pod cgroup
+		return nil
 	}
 
 	// Verify pod cgroup
@@ -399,7 +415,7 @@ func verifyPodContainersCgroupValues(ctx context.Context, f *framework.Framework
 
 	expectedPodCPUShares := int64(kubecm.MilliCPUToShares(podCPURequestMilliValue))
 	expectedPodCPUQuota := int64(-1)
-	if podCPULimitMilliValue >= 0 {
+	if podCPULimitMilliValue > 0 {
 		expectedPodCPUQuota = kubecm.MilliCPUToQuota(podCPULimitMilliValue, kubecm.QuotaPeriod)
 	}
 	expectedPodCPULimitString := strconv.FormatInt(expectedPodCPUQuota, 10)
@@ -417,7 +433,7 @@ func verifyPodContainersCgroupValues(ctx context.Context, f *framework.Framework
 		}
 		// convert cgroup v1 cpu.shares value to cgroup v2 cpu.weight value
 		// https://github.com/kubernetes/enhancements/tree/master/keps/sig-node/2254-cgroup-v2#phase-1-convert-from-cgroups-v1-settings-to-v2
-		expectedPodCPUShares = int64(1 + ((expectedPodCPUShares-2)*9999)/262142)
+		expectedPodCPUShares = 1 + ((expectedPodCPUShares-2)*9999)/262142
 	}
 
 	var cgroupName kubecm.CgroupName
@@ -440,28 +456,15 @@ func verifyPodContainersCgroupValues(ctx context.Context, f *framework.Framework
 	if err != nil {
 		return err
 	}
-	if IsCgroup2UnifiedMode() {
-		if err := verifyPodCgroupValue(filepath.Join(subsystems.MountPoints["cpu"], cgroupFsName, "cpu.weight"), strconv.FormatInt(expectedPodCPUShares, 10)); err != nil {
-			return err
-		}
-		if err := verifyPodCgroupValue(filepath.Join(subsystems.MountPoints["cpu"], cgroupFsName, "cpu.max"), expectedPodCPULimitString); err != nil {
-			return err
-		}
-		if err := verifyPodCgroupValue(filepath.Join(subsystems.MountPoints["memory"], cgroupFsName, "memory.max"), expectedPodMemLimitString); err != nil {
-			return err
-		}
-	} else {
-		if err := verifyPodCgroupValue(filepath.Join(subsystems.MountPoints["cpu"], cgroupFsName, "cpu.shares"), strconv.FormatInt(expectedPodCPUShares, 10)); err != nil {
-			return err
-		}
-		if err := verifyPodCgroupValue(filepath.Join(subsystems.MountPoints["cpu"], cgroupFsName, "cpu.cfs_quota_us"), expectedPodCPULimitString); err != nil {
-			return err
-		}
-		if expectedPodMemLimitString != "0" {
-			if err := verifyPodCgroupValue(filepath.Join(subsystems.MountPoints["memory"], cgroupFsName, "memory.limit_in_bytes"), expectedPodMemLimitString); err != nil {
-				return err
-			}
-		}
+
+	if err := verifyPodCgroupValue(filepath.Join(subsystems.MountPoints["cpu"], cgroupFsName, "cpu.weight"), strconv.FormatInt(expectedPodCPUShares, 10)); err != nil {
+		return err
+	}
+	if err := verifyPodCgroupValue(filepath.Join(subsystems.MountPoints["cpu"], cgroupFsName, "cpu.max"), expectedPodCPULimitString); err != nil {
+		return err
+	}
+	if err := verifyPodCgroupValue(filepath.Join(subsystems.MountPoints["memory"], cgroupFsName, "memory.max"), expectedPodMemLimitString); err != nil {
+		return err
 	}
 
 	return nil
