@@ -421,14 +421,14 @@ func verifyPodContainersCgroupValues(ctx context.Context, f *framework.Framework
 	}
 
 	var cgroupName kubecm.CgroupName
-	var subgroup string
 	switch pod.Status.QOSClass {
+	case v1.PodQOSGuaranteed:
+		cgroupName = kubecm.NewCgroupName(kubecm.RootCgroupName, defaultNodeAllocatableCgroup, "pod"+string(pod.UID))
 	case v1.PodQOSBurstable:
-		subgroup = "burstable"
+		cgroupName = kubecm.NewCgroupName(kubecm.RootCgroupName, defaultNodeAllocatableCgroup, "burstable", "pod"+string(pod.UID))
 	case v1.PodQOSBestEffort:
-		subgroup = "besteffort"
+		cgroupName = kubecm.NewCgroupName(kubecm.RootCgroupName, defaultNodeAllocatableCgroup, "besteffort", "pod"+string(pod.UID))
 	}
-	cgroupName = kubecm.NewCgroupName(kubecm.RootCgroupName, defaultNodeAllocatableCgroup, subgroup, "pod"+string(pod.UID))
 	cgroupFsName := ""
 	if kubeletCfg.CgroupDriver == "systemd" {
 		cgroupFsName = cgroupName.ToSystemd()
